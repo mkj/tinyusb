@@ -82,6 +82,7 @@
 
 // ValentyUSB eptri
 #define OPT_MCU_VALENTYUSB_EPTRI  600 ///< Fomu eptri config
+#define OPT_MCU_LUNA_EPTRI        601 ///< LUNA eptri config
 
 // NXP iMX RT
 #define OPT_MCU_MIMXRT10XX        700 ///< NXP iMX RT10xx
