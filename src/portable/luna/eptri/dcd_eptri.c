@@ -443,10 +443,6 @@ static void handle_setup(void)
 	// If we have 8 bytes, that's a full SETUP packet
 	// Otherwise, it was an RX error.
 	if (setup_length == 8) {
-		// After a SETUP packet, we always start with a DATA1 PID.
-		// XXX MOVE THIS OUT OF HERE XXX
-		usb_in_ep_pid_write(1);
-
 		dcd_event_setup_received(0, setup_packet_bfr, true);
 	} else {
 		debug_log("invalid setup length???\n");
