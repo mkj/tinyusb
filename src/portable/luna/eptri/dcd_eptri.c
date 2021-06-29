@@ -27,12 +27,7 @@
  */
 
 #include "tusb_option.h"
-
 #include "bsp/board.h"
-void debug_log(const char *str)
-{
-	board_uart_write(str, strlen(str));
-}
 
 #if TUSB_OPT_DEVICE_ENABLED && (CFG_TUSB_MCU == OPT_MCU_LUNA_EPTRI)
 
@@ -45,16 +40,18 @@ void debug_log(const char *str)
 //--------------------------------------------------------------------+
 
 #define EP_SIZE 64
+#define EP_COUNT 16
 
-uint16_t volatile rx_buffer_offset[16];
-uint8_t* volatile rx_buffer[16];
-uint16_t volatile rx_buffer_max[16];
+
+uint16_t volatile rx_buffer_offset[EP_COUNT];
+uint8_t* volatile rx_buffer[EP_COUNT];
+uint16_t volatile rx_buffer_max[EP_COUNT];
 
 volatile uint8_t tx_ep;
 volatile bool tx_active;
-volatile uint16_t tx_buffer_offset[16];
-uint8_t* volatile tx_buffer[16];
-volatile uint16_t tx_buffer_max[16];
+volatile uint16_t tx_buffer_offset[EP_COUNT];
+uint8_t* volatile tx_buffer[EP_COUNT];
+volatile uint16_t tx_buffer_max[EP_COUNT];
 volatile uint8_t reset_count;
 
 //--------------------------------------------------------------------+
@@ -113,7 +110,7 @@ static void process_tx(void) {
 }
 
 static void process_rx(void) {
-	uint8_t rx_ep = usb_out_ep_epno_read();
+	uint8_t rx_ep = usb_out_ep_data_ep_read();
 
 	// Drain the FIFO into the destination buffer
 	uint32_t total_read = 0;
@@ -135,7 +132,7 @@ static void process_rx(void) {
 	// If there's no more data, complete the transfer to tinyusb
 	if ((rx_buffer_max[rx_ep] == rx_buffer_offset[rx_ep])
 	// ZLP with less than the total amount of data
-	|| ((total_read == 2) && ((rx_buffer_offset[rx_ep] & 63) == 0))
+	|| ((total_read == 0) && ((rx_buffer_offset[rx_ep] & 63) == 0))
 	// Short read, but not a full packet
 	|| (((rx_buffer_offset[rx_ep] & 63) != 0) && (total_read < 66))) {
 
@@ -143,11 +140,16 @@ static void process_rx(void) {
 		rx_buffer[rx_ep] = NULL;
 		uint16_t len = rx_buffer_offset[rx_ep];
 
+
+		// Re-enable our OUT endpoint, as we've consumed all data from it.
+		usb_out_ep_enable_write(1);
+
 		dcd_event_xfer_complete(0, tu_edpt_addr(rx_ep, TUSB_DIR_OUT), len, XFER_RESULT_SUCCESS, true);
+
+
 	}
 	else {
-		// If there's more data, re-enable data reception on this endpoint
-		usb_out_ep_epno_write(rx_ep);
+		// If there's more data, re-enable data reception.
 		usb_out_ep_enable_write(1);
 	}
 
@@ -186,16 +188,32 @@ static void dcd_reset(void)
 
 	// Enable all event handlers and clear their contents
 	usb_device_controller_ev_pending_write(0xff);
-	usb_setup_ev_pending_write(0xff);
-	usb_in_ep_ev_pending_write(0xff);
-	usb_out_ep_ev_pending_write(0xff);
+	usb_setup_ev_pending_write(usb_setup_ev_pending_read());
+	usb_in_ep_ev_pending_write(usb_in_ep_ev_pending_read());
+	usb_out_ep_ev_pending_write(usb_out_ep_ev_pending_read());
 	usb_in_ep_ev_enable_write(1);
 	usb_out_ep_ev_enable_write(1);
 	usb_setup_ev_enable_write(1);
 	usb_device_controller_ev_enable_write(1);
 
-	dcd_event_bus_reset(0, TUSB_SPEED_HIGH, true);
+	if (usb_device_controller_speed_read())	 {
+		dcd_event_bus_reset(0, TUSB_SPEED_FULL, true);
+	} else {
+		dcd_event_bus_reset(0, TUSB_SPEED_HIGH, true);
+	}
+
 }
+
+static void clear_endpoints(void)
+{
+	tx_active = false;
+
+	for (int i = 0; i < EP_COUNT; ++i) {
+		rx_buffer[i] = NULL;
+		tx_buffer[i] = NULL;
+	}
+}
+
 
 // Initializes the USB peripheral for device mode and enables it.
 void dcd_init(uint8_t rhport)
@@ -207,6 +225,8 @@ void dcd_init(uint8_t rhport)
 	usb_setup_reset_write(1);
 	usb_in_ep_reset_write(1);
 	usb_out_ep_reset_write(1);
+
+	clear_endpoints();
 
 	// Enable all event handlers and clear their contents
 	usb_device_controller_ev_pending_write(usb_device_controller_ev_pending_read());
@@ -250,8 +270,7 @@ void dcd_set_address(uint8_t rhport, uint8_t dev_addr)
 	dcd_edpt_xfer(rhport, tu_edpt_addr(0, TUSB_DIR_IN), NULL, 0);
 
 	// Wait for the response packet to get sent
-	while (tx_active)
-		;
+	while (tx_active);
 
 	// Activate the new address
 	usb_setup_address_write(dev_addr);
@@ -353,6 +372,7 @@ bool dcd_edpt_xfer (uint8_t rhport, uint8_t ep_addr, uint8_t* buffer, uint16_t t
 	if (ep_dir == TUSB_DIR_IN) {
 		// Wait for the tx pipe to free up
 		uint8_t previous_reset_count = reset_count;
+
 		// Continue until the buffer is empty, the system is idle, and the fifo is empty.
 		while (tx_buffer[ep_num] != NULL)
 			;
@@ -385,14 +405,17 @@ bool dcd_edpt_xfer (uint8_t rhport, uint8_t ep_addr, uint8_t* buffer, uint16_t t
 			;
 
 		TU_ASSERT(rx_buffer[ep_num] == NULL);
+
 		dcd_int_disable(0);
 		rx_buffer[ep_num] = buffer;
 		rx_buffer_offset[ep_num] = 0;
 		rx_buffer_max[ep_num] = total_bytes;
 
-		// Enable receiving on this particular endpoint
+		// Enable receiving on this particular endpoint, if it hasn't been already.
 		usb_out_ep_epno_write(ep_num);
+		usb_out_ep_prime_write(1);
 		usb_out_ep_enable_write(1);
+
 		dcd_int_enable(0);
 	}
 	return true;
@@ -444,8 +467,6 @@ static void handle_setup(void)
 	// Otherwise, it was an RX error.
 	if (setup_length == 8) {
 		dcd_event_setup_received(0, setup_packet_bfr, true);
-	} else {
-		debug_log("invalid setup length???\n");
 	}
 
 	usb_setup_ev_pending_write(usb_setup_ev_pending_read());
